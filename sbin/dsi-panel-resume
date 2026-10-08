@@ -1,0 +1,65 @@
+#!/bin/sh
+# Chuwi MiniBook X (N150) — S3 resume 후 DSI 패널 수동 복구
+#
+# 원인: FreeBSD drm-kmod는 VBT MIPI 시퀀스의 GPIO op(3)을 구현하지 않아
+# resume 시 패널 전원(AVDD)·하드웨어 리셋·백라이트 enable이 전부 건너뛰어짐.
+# 이 스크립트가 Linux i915의 icl_native_gpio_set_value와 같은 레지스터 조작을
+# 수동으로 재현한 뒤 xrandr로 패널을 재초기화한다 (2026-10-09 검증 완료).
+#
+# 레지스터 (GPU BAR0 기준):
+#   PP_CONTROL(0)   0xC7204 bit0 = MIPI_AVDD_EN_1  (패널 아날로그 전원)
+#   PP_CONTROL(1)   0xC7304 bit2 = MIPI_BKLT_EN_2  (백라이트 enable)
+#   SHOTPLUG_CTL_DDI 0xC4030 HPD_A nibble = MIPI_RESET_1 (리셋 1->0->1 토글)
+
+PY=/usr/local/bin/python3.12
+LOG="logger -t dsi_panel_resume"
+
+BAR0=$(pciconf -lb vgapci0 2>/dev/null | awk '/bar +\[10\]/ {for(i=1;i<NF;i++) if($i=="base") {gsub(",","",$(i+1)); print $(i+1)}}')
+if [ -z "$BAR0" ]; then
+	$LOG "cannot find vgapci0 BAR0, skipping"
+	exit 0
+fi
+
+$LOG "restoring DSI panel power/reset (BAR0=$BAR0)"
+
+BAR0=$BAR0 $PY <<'EOF'
+import mmap, os, struct, time
+
+bar0 = int(os.environ['BAR0'], 16)
+fd = os.open('/dev/mem', os.O_RDWR)
+
+def reg(page_off):
+    return mmap.mmap(fd, 0x1000, offset=bar0 + page_off)
+
+def rd(m, o):  return struct.unpack('<I', m[o:o+4])[0]
+def wr(m, o, v): m[o:o+4] = struct.pack('<I', v)
+
+# 1) 패널 AVDD on (PPS0 bit0) + 백라이트 enable (PPS1 bit2)
+pp = reg(0xC7000)
+wr(pp, 0x204, rd(pp, 0x204) | 0x1)
+wr(pp, 0x304, rd(pp, 0x304) | 0x4)
+time.sleep(0.02)
+
+# 2) 패널 하드웨어 리셋 토글: HPD_A를 GPIO 출력으로 1 -> 0 -> 1
+sp = reg(0xC4000)
+ENA_A, OUT_A = 0x8, 0x4
+v = rd(sp, 0x30)
+wr(sp, 0x30, (v & ~ENA_A) | OUT_A); time.sleep(0.01)
+wr(sp, 0x30, rd(sp, 0x30) & ~(ENA_A | OUT_A)); time.sleep(0.01)
+wr(sp, 0x30, (rd(sp, 0x30) & ~ENA_A) | OUT_A)
+time.sleep(0.25)
+EOF
+
+# 3) X가 떠 있으면 패널 재초기화 (드라이버가 INIT_OTP/DISPLAY_ON 패킷 재전송)
+XAUTH=$(ls /var/run/sddm/xauth_* 2>/dev/null | head -1)
+if [ -n "$XAUTH" ]; then
+	export DISPLAY=:0 XAUTHORITY="$XAUTH"
+	/usr/local/bin/xrandr --output DSI-1 --off 2>/dev/null
+	sleep 1
+	/usr/local/bin/xrandr --output DSI-1 --mode 1200x1920 --rotate right --pos 0x0 2>/dev/null
+	$LOG "panel reinitialized via xrandr"
+else
+	$LOG "no X session found; skipped xrandr reinit (console/efifb은 복구 불가)"
+fi
+
+exit 0

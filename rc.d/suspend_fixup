@@ -1,0 +1,48 @@
+#!/bin/sh
+
+# PROVIDE: suspend_fixup
+# KEYWORD: nojail nostart suspend resume
+#
+# Chuwi MiniBook X (N150) + FreeBSD 15.1:
+# iwlwifi(AX101)와 sdhci가 suspend/resume 경로에서 복구되지 않아
+# resume 시 커널이 행 걸린다 (iwlwifi 레지스터 전부 0xff, sdhci timeout).
+# suspend 직전 두 장치를 분리하고 resume 후 다시 붙인다.
+# 2026-10-08 테스트로 확인: 이 두 장치만 빼면 S3 suspend/resume 정상 동작.
+
+. /etc/rc.subr
+
+name="suspend_fixup"
+desc="Detach iwlwifi/sdhci around S3 suspend"
+start_cmd=":"
+stop_cmd=":"
+suspend_cmd="suspend_fixup_suspend"
+resume_cmd="suspend_fixup_resume"
+extra_commands="suspend resume"
+
+SDHCI_PCI="pci0:0:26:0"
+
+suspend_fixup_suspend()
+{
+	/usr/bin/logger -t suspend_fixup "detaching wlan0/iwlwifi/sdhci before suspend"
+	/usr/sbin/service netif stop wlan0 > /dev/null 2>&1
+	/sbin/ifconfig wlan0 destroy > /dev/null 2>&1
+	/sbin/kldunload if_iwlwifi > /dev/null 2>&1
+	/usr/sbin/devctl detach ${SDHCI_PCI} > /dev/null 2>&1
+	/usr/bin/logger -t suspend_fixup "detach done"
+}
+
+suspend_fixup_resume()
+{
+	/usr/bin/logger -t suspend_fixup "reattaching devices after resume"
+	# DSI 패널 전원/리셋/백라이트 복구 (drm-kmod GPIO op 미구현 우회)
+	/usr/local/sbin/dsi-panel-resume > /dev/null 2>&1
+	/usr/sbin/devctl attach ${SDHCI_PCI} > /dev/null 2>&1
+	/sbin/kldload if_iwlwifi > /dev/null 2>&1
+	# iwlwifi0 attach 및 펌웨어 로드 대기
+	/bin/sleep 2
+	/usr/sbin/service netif start wlan0 > /dev/null 2>&1
+	/usr/bin/logger -t suspend_fixup "reattach done"
+}
+
+load_rc_config $name
+run_rc_command "$1"
